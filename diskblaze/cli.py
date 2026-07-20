@@ -93,6 +93,23 @@ class ProgressMux:
             )
 
 
+class QuietProgress:
+    """One stderr line per transfer phase; used with ``--no-progress``."""
+
+    def __init__(self) -> None:
+        self._phases: dict[str, str] = {}
+
+    def __call__(self, event: TransferProgress) -> None:
+        previous = self._phases.get(event.path)
+        if previous != event.phase:
+            self._phases[event.path] = event.phase
+            print(
+                f"{event.phase} {short_path(event.path)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def short_path(value: str, width: int = 72) -> str:
     if len(value) <= width:
         return value
@@ -363,8 +380,8 @@ def command_upload(args: argparse.Namespace) -> int:
         console.print(f"[yellow]dry-run[/yellow] would upload {local} -> {remote}")
         return 0
     progress = transfer_progress(disable=getattr(args, "no_progress", False))
+    mux = QuietProgress() if getattr(args, "no_progress", False) else ProgressMux(progress)
     with progress:
-        mux = ProgressMux(progress)
         if local.is_dir():
             result = client.upload_tree(
                 local,
@@ -399,8 +416,8 @@ def command_download(args: argparse.Namespace) -> int:
         console.print(f"[yellow]dry-run[/yellow] would download {args.remote} -> {output}")
         return 0
     progress = transfer_progress(disable=getattr(args, "no_progress", False))
+    mux = QuietProgress() if getattr(args, "no_progress", False) else ProgressMux(progress)
     with progress:
-        mux = ProgressMux(progress)
         if args.recursive:
             paths = client.download_tree(
                 args.remote,
@@ -468,8 +485,8 @@ def command_sync(args: argparse.Namespace) -> int:
         return 0
 
     progress = transfer_progress(disable=getattr(args, "no_progress", False))
+    mux = QuietProgress() if getattr(args, "no_progress", False) else ProgressMux(progress)
     with progress:
-        mux = ProgressMux(progress)
         for rel, remote_path in plan.to_upload:
             client.upload_file(
                 local / rel,

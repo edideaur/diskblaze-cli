@@ -12,11 +12,12 @@ import pytest
 import requests
 from requests.structures import CaseInsensitiveDict
 
-from diskblaze.cli import transfer_progress
+from diskblaze.cli import QuietProgress, transfer_progress
 from diskblaze.client import (
     CurrentUser,
     DiskBlazeClient,
     FileNode,
+    TransferProgress,
     UploadPlan,
     _parse_retry_after,
     normalize_remote_path,
@@ -1040,3 +1041,14 @@ def test_graphql_concurrency_is_bounded():
 def test_transfer_progress_disable_flag():
     assert transfer_progress(disable=True).disable is True
     assert transfer_progress().disable is False
+
+
+def test_quiet_progress_emits_one_line_per_phase(capsys):
+    qp = QuietProgress()
+    qp(TransferProgress("/a.mp3", 0, 100, "uploading", 0))
+    qp(TransferProgress("/a.mp3", 100, 100, "completing", 0))
+    qp(TransferProgress("/a.mp3", 100, 100, "completing", 0))  # dedupe
+    qp(TransferProgress("/b.mp3", 0, 50, "uploading", 0))
+    err = capsys.readouterr().err
+    assert "uploading" in err and "completing" in err
+    assert err.count("completing") == 1

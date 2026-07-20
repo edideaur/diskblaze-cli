@@ -145,7 +145,7 @@ query Files($path: String!) {
 SEARCH_FILES = """
 query SearchFiles(
   $query: String!
-  $pathPrefix: String
+  $pathPrefix: String!
   $kind: String
   $minSizeBytes: ID
   $maxSizeBytes: ID
@@ -276,6 +276,9 @@ class _ProgressReader:
         self.lock = threading.Lock()
         handle.seek(int(offset))
 
+    def __len__(self) -> int:
+        return self.remaining
+
     def __iter__(self):
         return self
 
@@ -379,7 +382,7 @@ class DiskBlazeClient:
             SEARCH_FILES,
             {
                 "query": str(query),
-                "pathPrefix": normalize_remote_path(path_prefix) if path_prefix else None,
+                "pathPrefix": normalize_remote_path(path_prefix or "/"),
                 "kind": kind,
                 "minSizeBytes": str(int(min_size_bytes)) if min_size_bytes is not None else None,
                 "maxSizeBytes": str(int(max_size_bytes)) if max_size_bytes is not None else None,
@@ -577,7 +580,9 @@ class DiskBlazeClient:
         for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
             self.ensure_folder(remote_folder)
         results: list[FileNode] = []
-        with ThreadPoolExecutor(max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-file") as executor:
+        executor = ThreadPoolExecutor(max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-file")
+        failed = False
+        try:
             futures = {}
             for file_path in files:
                 rel = file_path.relative_to(root).as_posix()
@@ -598,7 +603,12 @@ class DiskBlazeClient:
                 try:
                     results.append(future.result())
                 except Exception as exc:
+                    failed = True
+                    for pending in futures:
+                        pending.cancel()
                     raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
+        finally:
+            executor.shutdown(wait=not failed, cancel_futures=failed)
         return results
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:

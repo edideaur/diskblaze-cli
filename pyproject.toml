@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "diskblaze"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast Python client and CLI for the DiskBlaze storage API — uploads, downloads, search, and more."
 readme = "README.md"
 requires-python = ">=3.10"

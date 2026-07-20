@@ -141,7 +141,7 @@ def build_client(args: argparse.Namespace) -> DiskBlazeClient:
     )
 
 
-def transfer_progress() -> Progress:
+def transfer_progress(*, disable: bool = False) -> Progress:
     return Progress(
         TextColumn("[progress.description]{task.description}", table_column=None),
         BarColumn(),
@@ -149,6 +149,7 @@ def transfer_progress() -> Progress:
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         console=console,
+        disable=disable,
     )
 
 
@@ -361,7 +362,7 @@ def command_upload(args: argparse.Namespace) -> int:
     if args.dry_run:
         console.print(f"[yellow]dry-run[/yellow] would upload {local} -> {remote}")
         return 0
-    progress = transfer_progress()
+    progress = transfer_progress(disable=getattr(args, "no_progress", False))
     with progress:
         mux = ProgressMux(progress)
         if local.is_dir():
@@ -397,7 +398,7 @@ def command_download(args: argparse.Namespace) -> int:
     if args.dry_run:
         console.print(f"[yellow]dry-run[/yellow] would download {args.remote} -> {output}")
         return 0
-    progress = transfer_progress()
+    progress = transfer_progress(disable=getattr(args, "no_progress", False))
     with progress:
         mux = ProgressMux(progress)
         if args.recursive:
@@ -466,7 +467,7 @@ def command_sync(args: argparse.Namespace) -> int:
         console.print("[green]in sync[/green]")
         return 0
 
-    progress = transfer_progress()
+    progress = transfer_progress(disable=getattr(args, "no_progress", False))
     with progress:
         mux = ProgressMux(progress)
         for rel, remote_path in plan.to_upload:
@@ -944,6 +945,11 @@ def add_transfer_common(parser: argparse.ArgumentParser) -> None:
         "--no-create-folders",
         action="store_true",
         help="Do not create remote folders automatically; fail if the parent is missing.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the live progress bar; print one line per file instead.",
     )
     parser.add_argument(
         "--include", default=None, help="Comma-separated glob(s) of files to include."

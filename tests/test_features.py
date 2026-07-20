@@ -12,6 +12,7 @@ import pytest
 import requests
 from requests.structures import CaseInsensitiveDict
 
+from diskblaze.cli import transfer_progress
 from diskblaze.client import (
     CurrentUser,
     DiskBlazeClient,
@@ -1034,3 +1035,8 @@ def test_graphql_concurrency_is_bounded():
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(lambda _: client.graphql("query { ok }"), range(12)))
     assert client._holder.peak <= 2
+
+
+def test_transfer_progress_disable_flag():
+    assert transfer_progress(disable=True).disable is True
+    assert transfer_progress().disable is False

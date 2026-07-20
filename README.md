@@ -75,6 +75,8 @@ Most transfer commands accept:
 - `--no-create-folders` — do not auto-create remote folders.
 - `--include` / `--exclude` — comma-separated globs to filter synced files.
 - `--verbose` — print per-file planning details.
+- `--no-progress` — disable the live progress bar; print one line per file
+  (useful when redirecting output to a log you want to read/copy).
 
 All commands also accept global request-tuning flags:
 

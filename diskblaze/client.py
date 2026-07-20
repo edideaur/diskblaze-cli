@@ -5,16 +5,15 @@ import os
 import posixpath
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
 from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
-
+from urllib3.util.retry import Retry
 
 DEFAULT_ENDPOINT = "https://diskblaze.com/graphql"
 MiB = 1024 * 1024
@@ -80,12 +79,56 @@ class TransferProgress:
     speed_bps: float
 
 
+@dataclass(frozen=True)
+class TrashEntry:
+    deletion_id: str
+    name: str
+    path: str
+    size_bytes: int
+    deleted_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ShareLink:
+    id: str
+    name: str
+    path: str
+    url: str | None
+    expires_at: str | None
+    password_protected: bool
+    instructions: str | None
+    created_at: str
+    expired: bool
+
+
+@dataclass(frozen=True)
+class CopyJob:
+    id: str
+    status: str
+    source_path: str
+    destination_path: str
+    total_bytes: int
+    processed_bytes: int
+    progress_percent: float
+
+
 ProgressCallback = Callable[[TransferProgress], None]
 
 
 CREATE_UPLOAD_PLAN = """
-mutation CreateUploadPlan($path: String!, $sizeBytes: ID!, $contentSha256: String, $partSize: Int) {
-  createUploadPlan(path: $path, sizeBytes: $sizeBytes, contentSha256: $contentSha256, partSize: $partSize) {
+mutation CreateUploadPlan(
+  $path: String!
+  $sizeBytes: ID!
+  $contentSha256: String
+  $partSize: Int
+) {
+  createUploadPlan(
+    path: $path
+    sizeBytes: $sizeBytes
+    contentSha256: $contentSha256
+    partSize: $partSize
+  ) {
     token
     path
     sizeBytes
@@ -98,7 +141,11 @@ mutation CreateUploadPlan($path: String!, $sizeBytes: ID!, $contentSha256: Strin
 """
 
 COMPLETE_UPLOAD = """
-mutation CompleteUpload($token: String!, $completedParts: [CompletedUploadPartInput!], $contentSha256: String) {
+mutation CompleteUpload(
+  $token: String!
+  $completedParts: [CompletedUploadPartInput!]
+  $contentSha256: String
+) {
   completeUpload(token: $token, completedParts: $completedParts, contentSha256: $contentSha256) {
     id
     name
@@ -127,8 +174,12 @@ query ZipUrl($path: String!, $expiresSeconds: Int) {
 """
 
 CREATE_FOLDER = """
-mutation CreateFolder($path: String!) {
-  createFolder(path: $path) { id name path parentPath isDir sizeBytes size updatedAt readonly contentSha256 }
+mutation CreateFolder(
+  $path: String!
+) {
+  createFolder(path: $path) {
+    id name path parentPath isDir sizeBytes size updatedAt readonly contentSha256
+  }
 }
 """
 
@@ -206,6 +257,96 @@ query Me {
 }
 """
 
+TRASH = """
+query Trash {
+  trash {
+    total
+    items {
+      deletionId
+      name
+      path
+      sizeBytes
+      deletedAt
+      expiresAt
+    }
+  }
+}
+"""
+
+RESTORE_TRASH = """
+mutation RestoreTrash($deletionId: String!) {
+  restoreTrash(deletionId: $deletionId) { ok message }
+}
+"""
+
+PURGE_TRASH = """
+mutation PurgeTrash($deletionId: String!) {
+  purgeTrash(deletionId: $deletionId) { ok message }
+}
+"""
+
+COPY_JOB = """
+mutation CreateCopyJob($src: String!, $dst: String!) {
+  createCopyJob(src: $src, dst: $dst) {
+    id
+    status
+    sourcePath
+    destinationPath
+    totalBytes
+    processedBytes
+    progressPercent
+  }
+}
+"""
+
+SHARE_LINKS = """
+query ShareLinks($path: String!) {
+  shareLinks(path: $path) {
+    id
+    name
+    path
+    url
+    expiresAt
+    passwordProtected
+    instructions
+    createdAt
+    expired
+  }
+}
+"""
+
+CREATE_SHARE_LINK = """
+mutation CreateShareLink(
+  $path: String!
+  $password: String
+  $instructions: String
+  $expiresHours: Int
+) {
+  createShareLink(
+    path: $path
+    password: $password
+    instructions: $instructions
+    expiresHours: $expiresHours
+  ) {
+    id
+    name
+    path
+    url
+    expiresAt
+    passwordProtected
+    instructions
+    createdAt
+    expired
+  }
+}
+"""
+
+REVOKE_SHARE_LINK = """
+mutation RevokeShareLink($shareId: String!) {
+  revokeShareLink(shareId: $shareId) { ok message }
+}
+"""
+
 
 def normalize_remote_path(path: str) -> str:
     value = "/" + str(path or "/").strip().lstrip("/")
@@ -259,6 +400,43 @@ def _user_from_payload(data: dict) -> CurrentUser:
     )
 
 
+def _trash_entry_from_payload(data: dict) -> TrashEntry:
+    return TrashEntry(
+        deletion_id=str(data["deletionId"]),
+        name=str(data.get("name") or ""),
+        path=str(data.get("path") or ""),
+        size_bytes=int(data.get("sizeBytes") or 0),
+        deleted_at=str(data.get("deletedAt") or ""),
+        expires_at=str(data.get("expiresAt") or ""),
+    )
+
+
+def _share_link_from_payload(data: dict) -> ShareLink:
+    return ShareLink(
+        id=str(data["id"]),
+        name=str(data.get("name") or ""),
+        path=str(data.get("path") or ""),
+        url=data.get("url"),
+        expires_at=data.get("expiresAt"),
+        password_protected=bool(data.get("passwordProtected")),
+        instructions=data.get("instructions"),
+        created_at=str(data.get("createdAt") or ""),
+        expired=bool(data.get("expired")),
+    )
+
+
+def _copy_job_from_payload(data: dict) -> CopyJob:
+    return CopyJob(
+        id=str(data["id"]),
+        status=str(data.get("status") or ""),
+        source_path=str(data.get("sourcePath") or ""),
+        destination_path=str(data.get("destinationPath") or ""),
+        total_bytes=int(data.get("totalBytes") or 0),
+        processed_bytes=int(data.get("processedBytes") or 0),
+        progress_percent=float(data.get("progressPercent") or 0.0),
+    )
+
+
 class _ProgressReader:
     def __init__(
         self,
@@ -304,13 +482,21 @@ class DiskBlazeClient:
         token: str | None = None,
         timeout: float = 120.0,
         pool_size: int = 64,
+        retries: int = 4,
+        retry_backoff: float = 0.5,
     ):
-        self.endpoint = (endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT).rstrip("/")
-        self.token = token or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
+        self.endpoint = (
+            endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT
+        ).rstrip("/")
+        self.token = (
+            token or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
+        )
         if not self.token:
             raise DiskBlazeError("DISKBLAZE_TOKEN or DISKBLAZE_API_KEY is required")
         self.timeout = float(timeout)
         self.pool_size = int(pool_size)
+        self.retries = int(retries)
+        self.retry_backoff = float(retry_backoff)
         self._headers = {"Authorization": f"Bearer {self.token}"}
         self._local = threading.local()
         self.session = self._new_session()
@@ -318,10 +504,17 @@ class DiskBlazeClient:
     def _new_session(self) -> requests.Session:
         session = requests.Session()
         session.headers.update(self._headers)
+        retry = Retry(
+            total=self.retries,
+            backoff_factor=self.retry_backoff,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=None,
+            raise_on_status=True,
+        )
         adapter = HTTPAdapter(
             pool_connections=self.pool_size,
             pool_maxsize=self.pool_size,
-            max_retries=0,
+            max_retries=retry,
             pool_block=False,
         )
         session.mount("http://", adapter)
@@ -335,31 +528,65 @@ class DiskBlazeClient:
             self._local.session = session
         return session
 
-    @retry(
-        retry=retry_if_exception_type((requests.RequestException, DiskBlazeError)),
-        wait=wait_exponential_jitter(initial=0.5, max=8),
-        stop=stop_after_attempt(4),
-        reraise=True,
-    )
     def graphql(self, query: str, variables: dict | None = None) -> dict:
-        response = self._session().post(
-            self.endpoint,
-            json={"query": query, "variables": variables or {}},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errors"):
-            message = payload["errors"][0].get("message") if isinstance(payload["errors"], list) else str(payload["errors"])
-            raise DiskBlazeError(message or "GraphQL request failed")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise DiskBlazeError("GraphQL response did not include data")
-        return data
+        attempts = max(self.retries, 1)
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                response = self._session().post(
+                    self.endpoint,
+                    json={"query": query, "variables": variables or {}},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("errors"):
+                    message = (
+                        payload["errors"][0].get("message")
+                        if isinstance(payload["errors"], list)
+                        else str(payload["errors"])
+                    )
+                    raise DiskBlazeError(message or "GraphQL request failed")
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    raise DiskBlazeError("GraphQL response did not include data")
+                return data
+            except (requests.RequestException, DiskBlazeError) as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
+                continue
+        raise last_exc if last_exc is not None else DiskBlazeError("GraphQL request failed")
 
     def list_files(self, path: str = "/") -> list[FileNode]:
         data = self.graphql(FILES, {"path": normalize_remote_path(path)})
         return [_node_from_payload(item) for item in data["files"]["items"]]
+
+    def get_node(self, path: str) -> FileNode | None:
+        """Return the node at ``path`` or ``None`` if it does not exist."""
+        normalized = normalize_remote_path(path)
+        if normalized == "/":
+            return None
+        parent = posixpath.dirname(normalized)
+        name = posixpath.basename(normalized)
+        for node in self.list_files(parent):
+            if node.name == name:
+                return node
+        return None
+
+    def list_recursive(self, path: str = "/") -> list[FileNode]:
+        """Return every file node beneath ``path`` (folders excluded)."""
+        root = normalize_remote_path(path)
+        files: list[FileNode] = []
+        stack = [root]
+        while stack:
+            folder = stack.pop()
+            for node in self.list_files(folder):
+                if node.is_dir:
+                    stack.append(node.path)
+                else:
+                    files.append(node)
+        return files
 
     def me(self) -> CurrentUser:
         data = self.graphql(ME)
@@ -425,6 +652,62 @@ class DiskBlazeClient:
             raise DiskBlazeError(str(payload.get("message") or "delete failed"))
         return str(payload.get("message") or "deleted")
 
+    def copy(self, src: str, dst: str) -> CopyJob:
+        """Start a server-side copy job from ``src`` to ``dst``."""
+        data = self.graphql(
+            COPY_JOB,
+            {"src": normalize_remote_path(src), "dst": normalize_remote_path(dst)},
+        )
+        return _copy_job_from_payload(data["createCopyJob"])
+
+    def trash(self) -> list[TrashEntry]:
+        data = self.graphql(TRASH)
+        return [_trash_entry_from_payload(item) for item in data["trash"]["items"]]
+
+    def restore_trash(self, deletion_id: str) -> str:
+        data = self.graphql(RESTORE_TRASH, {"deletionId": str(deletion_id)})
+        payload = data["restoreTrash"]
+        if not payload.get("ok"):
+            raise DiskBlazeError(str(payload.get("message") or "restore failed"))
+        return str(payload.get("message") or "restored")
+
+    def purge_trash(self, deletion_id: str) -> str:
+        data = self.graphql(PURGE_TRASH, {"deletionId": str(deletion_id)})
+        payload = data["purgeTrash"]
+        if not payload.get("ok"):
+            raise DiskBlazeError(str(payload.get("message") or "purge failed"))
+        return str(payload.get("message") or "purged")
+
+    def share_links(self, path: str) -> list[ShareLink]:
+        data = self.graphql(SHARE_LINKS, {"path": normalize_remote_path(path)})
+        return [_share_link_from_payload(item) for item in data["shareLinks"]]
+
+    def create_share_link(
+        self,
+        path: str,
+        *,
+        password: str | None = None,
+        instructions: str | None = None,
+        expires_hours: int | None = None,
+    ) -> ShareLink:
+        data = self.graphql(
+            CREATE_SHARE_LINK,
+            {
+                "path": normalize_remote_path(path),
+                "password": password,
+                "instructions": instructions,
+                "expiresHours": expires_hours,
+            },
+        )
+        return _share_link_from_payload(data["createShareLink"])
+
+    def revoke_share_link(self, share_id: str) -> str:
+        data = self.graphql(REVOKE_SHARE_LINK, {"shareId": str(share_id)})
+        payload = data["revokeShareLink"]
+        if not payload.get("ok"):
+            raise DiskBlazeError(str(payload.get("message") or "revoke failed"))
+        return str(payload.get("message") or "revoked")
+
     def create_upload_plan(
         self,
         path: str,
@@ -485,16 +768,45 @@ class DiskBlazeClient:
         part_size: int | None = None,
         checksum: bool = False,
         ensure_parent: bool = True,
+        resume: bool = False,
+        dry_run: bool = False,
         progress: ProgressCallback | None = None,
     ) -> FileNode:
         path = Path(local_path)
         size = path.stat().st_size
         remote = normalize_remote_path(remote_path)
         parent = posixpath.dirname(remote)
+        if dry_run:
+            # No side effects; report the intended target as if it succeeded.
+            return FileNode(
+                id="",
+                name=posixpath.basename(remote),
+                path=remote,
+                parent_path=parent,
+                is_dir=False,
+                size_bytes=size,
+                size=str(size),
+                updated_at="",
+            )
+        if resume:
+            existing = self.get_node(remote)
+            if existing is not None and existing.size_bytes == size:
+                if not checksum:
+                    progress and progress(TransferProgress(remote, size, size, "skipped", 0))
+                    return existing
+                sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress)
+                if existing.content_sha256 and existing.content_sha256.lower() == sha256.lower():
+                    progress and progress(TransferProgress(remote, size, size, "skipped", 0))
+                    return existing
+        if checksum:
+            sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress)
+        else:
+            sha256 = None
         if ensure_parent and parent and parent != "/":
             self.ensure_folder(parent)
-        sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress) if checksum else None
-        plan = self.create_upload_plan(remote, size_bytes=size, content_sha256=sha256, part_size=part_size)
+        plan = self.create_upload_plan(
+            remote, size_bytes=size, content_sha256=sha256, part_size=part_size
+        )
         started = time.monotonic()
         transferred = 0
         lock = threading.Lock()
@@ -512,17 +824,20 @@ class DiskBlazeClient:
             report_absolute(transferred + int(delta), phase)
 
         if plan.put_url:
-            for attempt in range(4):
+            attempts = max(self.retries, 1)
+            for attempt in range(attempts):
                 try:
                     report_absolute(0)
                     with path.open("rb") as handle:
-                        reader = _ProgressReader(handle, length=size, offset=0, callback=lambda n: bump(n))
+                        reader = _ProgressReader(
+                            handle, length=size, offset=0, callback=lambda n: bump(n)
+                        )
                         self._put_stream(plan.put_url, reader, length=size)
                     break
                 except requests.RequestException:
-                    if attempt == 3:
+                    if attempt == attempts - 1:
                         raise
-                    time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                    time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
             progress and progress(TransferProgress(remote, size, size, "completing", 0))
             return self.complete_upload(plan.token, content_sha256=sha256 or None)
 
@@ -541,7 +856,9 @@ class DiskBlazeClient:
                 progress(TransferProgress(remote, total, size, "uploading", total / elapsed))
 
         max_workers = max(1, min(int(workers), len(plan.parts)))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="diskblaze-upload") as executor:
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="diskblaze-upload"
+        ) as executor:
             futures = {
                 executor.submit(self._upload_part, path, part, bump_part): part
                 for part in plan.parts
@@ -554,7 +871,9 @@ class DiskBlazeClient:
                     raise DiskBlazeError(f"part {part.number} failed: {exc}") from exc
         completed.sort(key=lambda item: int(item["number"]))
         progress and progress(TransferProgress(remote, size, size, "completing", 0))
-        return self.complete_upload(plan.token, completed_parts=completed, content_sha256=sha256 or None)
+        return self.complete_upload(
+            plan.token, completed_parts=completed, content_sha256=sha256 or None
+        )
 
     def upload_tree(
         self,
@@ -564,23 +883,40 @@ class DiskBlazeClient:
         workers: int = 8,
         file_workers: int = 2,
         checksum: bool = False,
+        resume: bool = False,
+        dry_run: bool = False,
+        create_folders: bool = True,
         progress: ProgressCallback | None = None,
     ) -> list[FileNode]:
         root = Path(local_path)
         if root.is_file():
-            return [self.upload_file(root, join_remote(remote_dir, root.name), workers=workers, checksum=checksum, progress=progress)]
+            return [
+                self.upload_file(
+                    root,
+                    join_remote(remote_dir, root.name),
+                    workers=workers,
+                    checksum=checksum,
+                    resume=resume,
+                    dry_run=dry_run,
+                    ensure_parent=create_folders,
+                    progress=progress,
+                )
+            ]
         files = [path for path in root.rglob("*") if path.is_file()]
-        dirs = {normalize_remote_path(remote_dir)}
-        for dir_path in (path for path in root.rglob("*") if path.is_dir()):
-            dirs.add(join_remote(remote_dir, dir_path.relative_to(root).as_posix()))
-        for file_path in files:
-            parent = file_path.relative_to(root).parent.as_posix()
-            if parent and parent != ".":
-                dirs.add(join_remote(remote_dir, parent))
-        for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
-            self.ensure_folder(remote_folder)
+        if create_folders:
+            dirs = {normalize_remote_path(remote_dir)}
+            for dir_path in (path for path in root.rglob("*") if path.is_dir()):
+                dirs.add(join_remote(remote_dir, dir_path.relative_to(root).as_posix()))
+            for file_path in files:
+                parent = file_path.relative_to(root).parent.as_posix()
+                if parent and parent != ".":
+                    dirs.add(join_remote(remote_dir, parent))
+            for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
+                self.ensure_folder(remote_folder)
         results: list[FileNode] = []
-        executor = ThreadPoolExecutor(max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-file")
+        executor = ThreadPoolExecutor(
+            max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-file"
+        )
         failed = False
         try:
             futures = {}
@@ -594,7 +930,9 @@ class DiskBlazeClient:
                         remote_path,
                         workers=workers,
                         checksum=checksum,
-                        ensure_parent=False,
+                        resume=resume,
+                        dry_run=dry_run,
+                        ensure_parent=create_folders,
                         progress=progress,
                     )
                 ] = file_path
@@ -612,12 +950,26 @@ class DiskBlazeClient:
         return results
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:
-        data = self.graphql(DOWNLOAD_URL, {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)})
+        data = self.graphql(
+            DOWNLOAD_URL,
+            {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)},
+        )
         return str(data["downloadUrl"]["url"])
 
     def zip_url(self, path: str, *, expires_seconds: int = 3600) -> str:
-        data = self.graphql(ZIP_URL, {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)})
+        data = self.graphql(
+            ZIP_URL, {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)}
+        )
         return str(data["zipUrl"]["url"])
+
+    def stream(self, path: str, *, expires_seconds: int = 3600, chunk_size: int = 1024 * 1024):
+        """Yield raw bytes of a remote file (for streaming to stdout)."""
+        url = self.download_url(path, expires_seconds=expires_seconds)
+        with self._session().get(url, stream=True, timeout=self.timeout) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    yield chunk
 
     def download(
         self,
@@ -627,20 +979,36 @@ class DiskBlazeClient:
         workers: int = 8,
         expires_seconds: int = 3600,
         as_zip: bool | None = None,
+        resume: bool = False,
+        dry_run: bool = False,
         progress: ProgressCallback | None = None,
     ) -> Path:
         remote = normalize_remote_path(remote_path)
         output = Path(local_path)
         if as_zip is None:
             as_zip = output.suffix.lower() == ".zip"
-        url = self.zip_url(remote, expires_seconds=expires_seconds) if as_zip else self.download_url(remote, expires_seconds=expires_seconds)
+        url = (
+            self.zip_url(remote, expires_seconds=expires_seconds)
+            if as_zip
+            else self.download_url(remote, expires_seconds=expires_seconds)
+        )
         if output.is_dir() or str(local_path).endswith(os.sep):
             name = posixpath.basename(remote.rstrip("/")) or "download"
             if as_zip and not name.endswith(".zip"):
                 name += ".zip"
             output = output / name
+        if dry_run:
+            return output
+        if resume and output.exists() and output.stat().st_size > 0:
+            # A complete local file is assumed current; skip re-download.
+            progress and progress(
+                TransferProgress(remote, output.stat().st_size, output.stat().st_size, "skipped", 0)
+            )
+            return output
         output.parent.mkdir(parents=True, exist_ok=True)
-        return self._download_url(url, output, display_path=remote, workers=workers, progress=progress)
+        return self._download_url(
+            url, output, display_path=remote, workers=workers, progress=progress
+        )
 
     def download_tree(
         self,
@@ -650,6 +1018,8 @@ class DiskBlazeClient:
         workers: int = 16,
         file_workers: int = 8,
         expires_seconds: int = 3600,
+        resume: bool = False,
+        dry_run: bool = False,
         progress: ProgressCallback | None = None,
     ) -> list[Path]:
         """Recursively download a remote folder as normal local files.
@@ -671,10 +1041,16 @@ class DiskBlazeClient:
                     files.append(node)
 
         results: list[Path] = []
-        with ThreadPoolExecutor(max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-dl-file") as executor:
+        with ThreadPoolExecutor(
+            max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-dl-file"
+        ) as executor:
             futures = {}
             for node in files:
-                rel = node.path[len(root_remote.rstrip("/") + "/") :] if node.path != root_remote else node.name
+                rel = (
+                    node.path[len(root_remote.rstrip("/") + "/") :]
+                    if node.path != root_remote
+                    else node.name
+                )
                 output = root_local / rel
                 futures[
                     executor.submit(
@@ -684,6 +1060,8 @@ class DiskBlazeClient:
                         workers=workers,
                         expires_seconds=expires_seconds,
                         as_zip=False,
+                        resume=resume,
+                        dry_run=dry_run,
                         progress=progress,
                     )
                 ] = node
@@ -753,14 +1131,20 @@ class DiskBlazeClient:
             with lock:
                 transferred += delta
                 elapsed = max(time.monotonic() - started, 0.001)
-                progress(TransferProgress(display_path, transferred, size, "downloading", transferred / elapsed))
+                progress(
+                    TransferProgress(
+                        display_path, transferred, size, "downloading", transferred / elapsed
+                    )
+                )
 
         if ranges and workers > 1:
             output.write_bytes(b"")
             with output.open("r+b") as handle:
                 handle.truncate(size)
             part_size = max(16 * MiB, min(128 * MiB, size // max(1, int(workers))))
-            ranges_to_get = [(start, min(size, start + part_size)) for start in range(0, size, part_size)]
+            ranges_to_get = [
+                (start, min(size, start + part_size)) for start in range(0, size, part_size)
+            ]
             range_progress: dict[int, int] = {}
 
             def bump_range(start: int, loaded: int) -> None:
@@ -771,10 +1155,19 @@ class DiskBlazeClient:
                     range_progress[int(start)] = max(0, int(loaded))
                     transferred = min(size, sum(range_progress.values()))
                     elapsed = max(time.monotonic() - started, 0.001)
-                    progress(TransferProgress(display_path, transferred, size, "downloading", transferred / elapsed))
+                    progress(
+                        TransferProgress(
+                            display_path, transferred, size, "downloading", transferred / elapsed
+                        )
+                    )
 
-            with ThreadPoolExecutor(max_workers=max(1, int(workers)), thread_name_prefix="diskblaze-download") as executor:
-                futures = [executor.submit(self._download_range, url, output, start, end, bump_range) for start, end in ranges_to_get]
+            with ThreadPoolExecutor(
+                max_workers=max(1, int(workers)), thread_name_prefix="diskblaze-download"
+            ) as executor:
+                futures = [
+                    executor.submit(self._download_range, url, output, start, end, bump_range)
+                    for start, end in ranges_to_get
+                ]
                 for future in as_completed(futures):
                     future.result()
         else:
@@ -786,18 +1179,32 @@ class DiskBlazeClient:
                             continue
                         handle.write(chunk)
                         bump(len(chunk))
-        progress and progress(TransferProgress(display_path, size or transferred, size or transferred, "done", 0))
+        progress and progress(
+            TransferProgress(display_path, size or transferred, size or transferred, "done", 0)
+        )
         return output
 
-    def _put_stream(self, url: str, body: Iterable[bytes], *, length: int, progress: Callable[[int], None] | None = None) -> str:
-        response = self._session().put(url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout)
+    def _put_stream(
+        self,
+        url: str,
+        body: Iterable[bytes],
+        *,
+        length: int,
+        progress: Callable[[int], None] | None = None,
+    ) -> str:
+        response = self._session().put(
+            url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout
+        )
         response.raise_for_status()
         return response.headers.get("ETag", "").replace('"', "")
 
-    def _upload_part(self, path: Path, part: UploadPart, progress: Callable[[int, int], None] | None) -> dict:
+    def _upload_part(
+        self, path: Path, part: UploadPart, progress: Callable[[int, int], None] | None
+    ) -> dict:
         length = part.end - part.start
         last_error: Exception | None = None
-        for attempt in range(4):
+        attempts = max(self.retries, 1)
+        for attempt in range(attempts):
             try:
                 if progress:
                     progress(part.number, 0)
@@ -810,43 +1217,56 @@ class DiskBlazeClient:
                         if progress:
                             progress(part.number, loaded)
 
-                    reader = _ProgressReader(handle, length=length, offset=part.start, callback=bump)
+                    reader = _ProgressReader(
+                        handle, length=length, offset=part.start, callback=bump
+                    )
                     etag = self._put_stream(part.url, reader, length=length)
                 break
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt == 3:
+                if attempt == attempts - 1:
                     raise
-                time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
         else:
             raise last_error or DiskBlazeError("part upload failed")
         return {"number": part.number, "etag": etag}
 
-    @retry(
-        retry=retry_if_exception_type(requests.RequestException),
-        wait=wait_exponential_jitter(initial=0.5, max=8),
-        stop=stop_after_attempt(4),
-        reraise=True,
-    )
-    def _download_range(self, url: str, output: Path, start: int, end: int, progress: Callable[[int, int], None]) -> None:
+    def _download_range(
+        self, url: str, output: Path, start: int, end: int, progress: Callable[[int, int], None]
+    ) -> None:
         headers = {"Range": f"bytes={start}-{end - 1}"}
-        loaded = 0
-        progress(start, 0)
-        with self._session().get(url, headers=headers, stream=True, timeout=self.timeout) as response:
-            response.raise_for_status()
-            if response.status_code != 206:
-                raise DiskBlazeError("server did not honor range request")
-            with output.open("r+b") as handle:
-                handle.seek(start)
-                for chunk in response.iter_content(chunk_size=4 * MiB):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    loaded += len(chunk)
-                    progress(start, loaded)
+        last_error: Exception | None = None
+        for attempt in range(max(self.retries, 1)):
+            try:
+                loaded = 0
+                progress(start, 0)
+                with self._session().get(
+                    url, headers=headers, stream=True, timeout=self.timeout
+                ) as response:
+                    response.raise_for_status()
+                    if response.status_code != 206:
+                        raise DiskBlazeError("server did not honor range request")
+                    with output.open("r+b") as handle:
+                        handle.seek(start)
+                        for chunk in response.iter_content(chunk_size=4 * MiB):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            loaded += len(chunk)
+                            progress(start, loaded)
+                return
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == max(self.retries, 1) - 1:
+                    raise
+                time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
+        if last_error:
+            raise last_error
 
     @staticmethod
-    def sha256(path: Path, *, progress_path: str, total: int, progress: ProgressCallback | None) -> str:
+    def sha256(
+        path: Path, *, progress_path: str, total: int, progress: ProgressCallback | None
+    ) -> str:
         digest = hashlib.sha256()
         read = 0
         started = time.monotonic()
@@ -859,7 +1279,9 @@ class DiskBlazeClient:
                 read += len(chunk)
                 if progress:
                     elapsed = max(time.monotonic() - started, 0.001)
-                    progress(TransferProgress(progress_path, read, total, "hashing", read / elapsed))
+                    progress(
+                        TransferProgress(progress_path, read, total, "hashing", read / elapsed)
+                    )
         return digest.hexdigest()
 
 

@@ -5,8 +5,7 @@ import stat
 
 import pytest
 
-from diskblaze import config
-from diskblaze import cli
+from diskblaze import cli, config
 
 
 @pytest.fixture
@@ -61,7 +60,9 @@ def test_resolve_endpoint_uses_saved_then_default(isolated_config):
     config.save_credentials("t", "https://saved.example/graphql")
     assert cli.resolve_endpoint(_ns()) == "https://saved.example/graphql"
     # A flag overrides the saved endpoint (bare host gets /graphql appended).
-    assert cli.resolve_endpoint(_ns(endpoint="https://flag.example")) == "https://flag.example/graphql"
+    assert (
+        cli.resolve_endpoint(_ns(endpoint="https://flag.example")) == "https://flag.example/graphql"
+    )
 
 
 def test_logout_command_reports_state(isolated_config, capsys):

@@ -23,3 +23,6 @@ htmlcov/
 
 # Local credentials (never commit real tokens)
 credentials.json
+
+# ty
+.ty/

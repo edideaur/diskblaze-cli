@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 import threading
+from pathlib import Path
 
 import requests
 
+from diskblaze.cli import build_parser
 from diskblaze.client import (
     DiskBlazeClient,
     FileNode,
@@ -15,7 +16,6 @@ from diskblaze.client import (
     join_remote,
     normalize_remote_path,
 )
-from diskblaze.cli import build_parser
 
 
 def test_remote_path_helpers_normalize_posix_paths():
@@ -34,8 +34,8 @@ def test_search_defaults_to_root_path_prefix():
         def __init__(self):
             pass
 
-        def graphql(self, _query, variables=None):
-            assert variables["pathPrefix"] == "/"
+        def graphql(self, _query: str, variables: dict | None = None) -> dict:  # ty: ignore[invalid-method-override]
+            assert variables["pathPrefix"] == "/"  # ty: ignore[not-subscriptable]
             return {"searchFiles": {"items": [], "hasMore": False}}
 
     assert SearchClient().search_files("smoke") == ([], False)
@@ -50,6 +50,7 @@ def test_cli_download_parser_has_remote_and_local_once():
 
 class FakeUploadClient(DiskBlazeClient):
     def __init__(self):
+        super().__init__(token="dummy")
         self.created_folders: list[str] = []
         self.plan_requests: list[dict] = []
         self.uploaded = bytearray()
@@ -58,7 +59,14 @@ class FakeUploadClient(DiskBlazeClient):
     def ensure_folder(self, path: str) -> None:
         self.created_folders.append(path)
 
-    def create_upload_plan(self, path: str, *, size_bytes: int, content_sha256: str | None = None, part_size: int | None = None):
+    def create_upload_plan(
+        self,
+        path: str,
+        *,
+        size_bytes: int,
+        content_sha256: str | None = None,
+        part_size: int | None = None,
+    ):
         self.plan_requests.append(
             {
                 "path": path,
@@ -84,7 +92,9 @@ class FakeUploadClient(DiskBlazeClient):
         assert len(self.uploaded) == length
         return "etag"
 
-    def complete_upload(self, token: str, *, completed_parts=None, content_sha256: str | None = None):
+    def complete_upload(
+        self, token: str, *, completed_parts=None, content_sha256: str | None = None
+    ):
         self.completed.append(
             {
                 "token": token,
@@ -148,7 +158,7 @@ def test_upload_tree_cancels_queued_files_after_failure(tmp_path: Path):
         def __init__(self):
             pass
 
-        def ensure_folder(self, _path):
+        def ensure_folder(self, path: str) -> None:
             return None
 
         def upload_file(self, path, *_args, **_kwargs):

@@ -80,6 +80,10 @@ All commands also accept global request-tuning flags:
 
 - `--retries N` — number of times to retry a failed request (default 4).
 - `--backoff S` — base retry backoff in seconds, applied exponentially (default 0.5).
+- `--backoff-cap C` — maximum seconds between retries (default 60).
+- `--graphql-concurrency K` — max concurrent control-plane (GraphQL) requests;
+  throttles API calls so high `--file-workers` won't trip HTTP 429 rate limits
+  (default 4). Data-plane transfers to object storage are unaffected.
 
 Listing commands (`ls`, `search`, `du`, `tree`, `trash`, `shares`, `whoami`,
 `stat`, `share`) accept `--output {table,json,csv}`. `--output json` (or the

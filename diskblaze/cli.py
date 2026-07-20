@@ -136,6 +136,8 @@ def build_client(args: argparse.Namespace) -> DiskBlazeClient:
         pool_size=max(args.workers * max(args.file_workers, 1) + 8, 32),
         retries=args.retries,
         retry_backoff=args.backoff,
+        backoff_cap=getattr(args, "backoff_cap", 60.0),
+        graphql_concurrency=getattr(args, "graphql_concurrency", 4),
     )
 
 
@@ -165,7 +167,13 @@ def command_login(args: argparse.Namespace) -> int:
 
     endpoint = resolve_endpoint(args)
     # Validate the token before saving so a typo fails loudly here.
-    client = DiskBlazeClient(endpoint=endpoint, token=token, timeout=args.timeout)
+    client = DiskBlazeClient(
+        endpoint=endpoint,
+        token=token,
+        timeout=args.timeout,
+        backoff_cap=getattr(args, "backoff_cap", 60.0),
+        graphql_concurrency=getattr(args, "graphql_concurrency", 4),
+    )
     user = client.me()
 
     # Only persist a non-default endpoint so upstream URL changes still apply.
@@ -901,6 +909,18 @@ def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = Fal
         type=float,
         default=0.5,
         help="Base retry backoff in seconds (exponential). Default: 0.5.",
+    )
+    parser.add_argument(
+        "--backoff-cap",
+        type=float,
+        default=60.0,
+        help="Maximum seconds between retries. Default: 60.",
+    )
+    parser.add_argument(
+        "--graphql-concurrency",
+        type=int,
+        default=4,
+        help="Max concurrent control-plane (GraphQL) requests. Default: 4.",
     )
 
 

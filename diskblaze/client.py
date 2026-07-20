@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import os
 import posixpath
@@ -8,6 +9,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,6 +19,27 @@ from urllib3.util.retry import Retry
 
 DEFAULT_ENDPOINT = "https://diskblaze.com/graphql"
 MiB = 1024 * 1024
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into seconds, or ``None`` if absent/invalid."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = (parsed - datetime.now(timezone.utc)).total_seconds()
+    return delta if delta > 0 else 0.0
 
 
 class DiskBlazeError(RuntimeError):
@@ -484,6 +507,8 @@ class DiskBlazeClient:
         pool_size: int = 64,
         retries: int = 4,
         retry_backoff: float = 0.5,
+        backoff_cap: float = 60.0,
+        graphql_concurrency: int = 4,
     ):
         self.endpoint = (
             endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT
@@ -497,6 +522,9 @@ class DiskBlazeClient:
         self.pool_size = int(pool_size)
         self.retries = int(retries)
         self.retry_backoff = float(retry_backoff)
+        self.backoff_cap = float(backoff_cap)
+        self.graphql_concurrency = max(1, int(graphql_concurrency))
+        self._graphql_sem = threading.Semaphore(self.graphql_concurrency)
         self._headers = {"Authorization": f"Bearer {self.token}"}
         self._local = threading.local()
         self.session = self._new_session()
@@ -507,9 +535,9 @@ class DiskBlazeClient:
         retry = Retry(
             total=self.retries,
             backoff_factor=self.retry_backoff,
-            status_forcelist=[429, 500, 502, 503, 504],
+            status_forcelist=[],
             allowed_methods=None,
-            raise_on_status=True,
+            raise_on_status=False,
         )
         adapter = HTTPAdapter(
             pool_connections=self.pool_size,
@@ -528,34 +556,58 @@ class DiskBlazeClient:
             self._local.session = session
         return session
 
+    def _retry_delay(self, attempt: int, retry_after: float | None) -> float:
+        """Next retry wait: exponential (capped) but never below ``retry_after``."""
+        delay = min(self.backoff_cap, self.retry_backoff * (2**attempt))
+        if retry_after:
+            delay = max(delay, retry_after)
+        return delay
+
     def graphql(self, query: str, variables: dict | None = None) -> dict:
         attempts = max(self.retries, 1)
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            try:
-                response = self._session().post(
-                    self.endpoint,
-                    json={"query": query, "variables": variables or {}},
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if payload.get("errors"):
-                    message = (
-                        payload["errors"][0].get("message")
-                        if isinstance(payload["errors"], list)
-                        else str(payload["errors"])
+            with self._graphql_sem:
+                try:
+                    response = self._session().post(
+                        self.endpoint,
+                        json={"query": query, "variables": variables or {}},
+                        timeout=self.timeout,
                     )
-                    raise DiskBlazeError(message or "GraphQL request failed")
-                data = payload.get("data")
-                if not isinstance(data, dict):
-                    raise DiskBlazeError("GraphQL response did not include data")
-                return data
-            except (requests.RequestException, DiskBlazeError) as exc:
-                last_exc = exc
-                if attempt < attempts - 1:
-                    time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
-                continue
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                        time.sleep(self._retry_delay(attempt, retry_after))
+                        continue
+                    response.raise_for_status()
+                    payload = response.json()
+                    if payload.get("errors"):
+                        message = (
+                            payload["errors"][0].get("message")
+                            if isinstance(payload["errors"], list)
+                            else str(payload["errors"])
+                        )
+                        raise DiskBlazeError(message or "GraphQL request failed")
+                    data = payload.get("data")
+                    if not isinstance(data, dict):
+                        raise DiskBlazeError("GraphQL response did not include data")
+                    return data
+                except (requests.RequestException, DiskBlazeError) as exc:
+                    last_exc = exc
+                    if attempt < attempts - 1:
+                        resp = getattr(exc, "response", None)
+                        retryable = (
+                            isinstance(resp, requests.Response)
+                            and resp.status_code in (429, 500, 502, 503, 504)
+                        ) or isinstance(exc, (requests.ConnectionError, DiskBlazeError))
+                        if retryable:
+                            retry_after = (
+                                _parse_retry_after(resp.headers.get("Retry-After"))
+                                if resp is not None
+                                else None
+                            )
+                            time.sleep(self._retry_delay(attempt, retry_after))
+                            continue
+                    break
         raise last_exc if last_exc is not None else DiskBlazeError("GraphQL request failed")
 
     def list_files(self, path: str = "/") -> list[FileNode]:
@@ -834,10 +886,13 @@ class DiskBlazeClient:
                         )
                         self._put_stream(plan.put_url, reader, length=size)
                     break
-                except requests.RequestException:
+                except requests.RequestException as exc:
                     if attempt == attempts - 1:
                         raise
-                    time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
+                    retry_after = _parse_retry_after(
+                        getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                    )
+                    time.sleep(self._retry_delay(attempt, retry_after))
             progress and progress(TransferProgress(remote, size, size, "completing", 0))
             return self.complete_upload(plan.token, content_sha256=sha256 or None)
 
@@ -1226,7 +1281,10 @@ class DiskBlazeClient:
                 last_error = exc
                 if attempt == attempts - 1:
                     raise
-                time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
+                retry_after = _parse_retry_after(
+                    getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                )
+                time.sleep(self._retry_delay(attempt, retry_after))
         else:
             raise last_error or DiskBlazeError("part upload failed")
         return {"number": part.number, "etag": etag}
@@ -1259,7 +1317,10 @@ class DiskBlazeClient:
                 last_error = exc
                 if attempt == max(self.retries, 1) - 1:
                     raise
-                time.sleep(min(8.0, self.retry_backoff * (2**attempt)))
+                retry_after = _parse_retry_after(
+                    getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                )
+                time.sleep(self._retry_delay(attempt, retry_after))
         if last_error:
             raise last_error
 

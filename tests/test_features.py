@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+import pytest
+import requests
+from requests.structures import CaseInsensitiveDict
 
 from diskblaze.client import (
     CurrentUser,
     DiskBlazeClient,
     FileNode,
     UploadPlan,
+    _parse_retry_after,
     normalize_remote_path,
 )
 from diskblaze.sync import plan_sync
@@ -912,3 +921,116 @@ def test_trash_older_than_keeps_recent_entries(capsys):
 
     reader = list(_csv.reader(StringIO(capsys.readouterr().out)))
     assert len(reader) == 2
+
+
+class _FakeResponse(requests.Response):
+    def __init__(self, status, headers=None, payload=None):
+        super().__init__()
+        self.status_code = status
+        self.headers = CaseInsensitiveDict(headers or {})
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
+    def json(self, **kwargs):
+        return self._payload
+
+
+class _FakeSession(requests.Session):
+    def __init__(self, responses):
+        super().__init__()
+        self._responses = list(responses)
+
+    def post(self, *args, **kwargs):
+        return self._responses.pop(0)
+
+
+class _RetryClient(DiskBlazeClient):
+    def __init__(self, responses):
+        super().__init__(token="dummy")
+        self._fake = _FakeSession(responses)
+
+    def _session(self):
+        return self._fake
+
+
+def test_parse_retry_after():
+    assert _parse_retry_after("30") == 30.0
+    assert _parse_retry_after("") is None
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("not-a-date") is None
+    future = (datetime.now(timezone.utc) + timedelta(seconds=45)).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+    value = _parse_retry_after(future)
+    assert value is not None and 40.0 <= value <= 50.0
+
+
+def test_retry_delay_caps_exponential_and_respects_retry_after():
+    client = DiskBlazeClient(token="dummy", retry_backoff=0.5, backoff_cap=60.0)
+    assert client._retry_delay(10, None) == 60.0
+    assert client._retry_delay(0, 120.0) == 120.0
+    assert client._retry_delay(5, 1.0) == 16.0
+
+
+def test_graphql_retries_on_429_and_honors_retry_after():
+    client = _RetryClient(
+        [
+            _FakeResponse(429, {"Retry-After": "2"}),
+            _FakeResponse(429, {"Retry-After": "3"}),
+            _FakeResponse(200, {}, {"data": {"ok": True}}),
+        ]
+    )
+    sleeps = []
+    with mock.patch("time.sleep", sleeps.append):
+        data = client.graphql("query { ok }")
+    assert data == {"ok": True}
+    assert sleeps == [2.0, 3.0]
+
+
+def test_graphql_surfaces_permanent_error_without_retry():
+    client = _RetryClient([_FakeResponse(403, {})])
+    with mock.patch("time.sleep", lambda _s: None), pytest.raises(requests.HTTPError):
+        client.graphql("query { ok }")
+
+
+class _SlowSession(requests.Session):
+    def __init__(self, holder):
+        super().__init__()
+        self._holder = holder
+
+    def post(self, *args, **kwargs):
+        with self._holder.lock:
+            self._holder.current += 1
+            self._holder.peak = max(self._holder.peak, self._holder.current)
+        time.sleep(0.05)
+        with self._holder.lock:
+            self._holder.current -= 1
+        return _FakeResponse(200, {}, {"data": {"ok": True}})
+
+
+class _Holder:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current = 0
+        self.peak = 0
+
+
+class _SlowClient(DiskBlazeClient):
+    def __init__(self):
+        super().__init__(token="dummy", graphql_concurrency=2)
+        self._holder = _Holder()
+        self._slow = _SlowSession(self._holder)
+
+    def _session(self):
+        return self._slow
+
+
+def test_graphql_concurrency_is_bounded():
+    client = _SlowClient()
+    assert client._graphql_sem._value == 2
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda _: client.graphql("query { ok }"), range(12)))
+    assert client._holder.peak <= 2

@@ -395,9 +395,13 @@ def command_upload(args: argparse.Namespace) -> int:
             )
             console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
         else:
+            target = remote
+            existing = client.get_node(target)
+            if existing is not None and existing.is_dir:
+                target = join_remote(target, local.name)
             node = client.upload_file(
                 local,
-                remote,
+                target,
                 workers=args.workers,
                 part_size=args.part_size,
                 checksum=not args.no_sha256,

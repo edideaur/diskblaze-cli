@@ -1052,3 +1052,57 @@ def test_quiet_progress_emits_one_line_per_phase(capsys):
     err = capsys.readouterr().err
     assert "uploading" in err and "completing" in err
     assert err.count("completing") == 1
+
+
+def test_upload_single_file_appends_name_into_existing_dir(tmp_path):
+    import diskblaze.cli as c
+
+    class _Up(DiskBlazeClient):
+        def __init__(self):
+            super().__init__(token="dummy")
+            self.recorded = None
+
+        def get_node(self, path):
+            if path == "/public/SpaceGhostPurrp":
+                return FileNode(
+                    id="d",
+                    name="SpaceGhostPurrp",
+                    path="/public/SpaceGhostPurrp",
+                    parent_path="/public",
+                    is_dir=True,
+                    size_bytes=0,
+                    size="0",
+                    updated_at="",
+                )
+            return None
+
+        def upload_file(self, local_path, remote_path, **kwargs):
+            self.recorded = remote_path
+            return FileNode(
+                id="f",
+                name="f",
+                path=remote_path,
+                parent_path="/public",
+                is_dir=False,
+                size_bytes=0,
+                size="0",
+                updated_at="",
+            )
+
+    client = _Up()
+    local = tmp_path / "song.mp3"
+    local.write_bytes(b"x")
+    args = _ns(
+        local=str(local),
+        remote="/public/SpaceGhostPurrp",
+        no_create_folders=True,
+        no_sha256=True,
+    )
+    orig = c.build_client
+    c.build_client = lambda a: client  # ty: ignore[invalid-assignment]
+    try:
+        rc = c.command_upload(args)
+    finally:
+        c.build_client = orig
+    assert rc == 0
+    assert client.recorded == "/public/SpaceGhostPurrp/song.mp3"

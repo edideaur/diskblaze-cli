@@ -556,6 +556,23 @@ class DiskBlazeClient:
             self._local.session = session
         return session
 
+    def _upload_session(self) -> requests.Session:
+        session = getattr(self._local, "upload_session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._headers)
+            retry = Retry(total=0, raise_on_status=False)
+            adapter = HTTPAdapter(
+                pool_connections=self.pool_size,
+                pool_maxsize=self.pool_size,
+                max_retries=retry,
+                pool_block=False,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._local.upload_session = session
+        return session
+
     def _retry_delay(self, attempt: int, retry_after: float | None) -> float:
         """Next retry wait: exponential (capped) but never below ``retry_after``."""
         delay = min(self.backoff_cap, self.retry_backoff * (2**attempt))
@@ -1247,8 +1264,14 @@ class DiskBlazeClient:
         length: int,
         progress: Callable[[int], None] | None = None,
     ) -> str:
-        response = self._session().put(
-            url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout
+        response = self._upload_session().put(
+            url,
+            data=body,
+            headers={
+                "Content-Length": str(int(length)),
+                "Connection": "close",
+            },
+            timeout=self.timeout,
         )
         response.raise_for_status()
         return response.headers.get("ETag", "").replace('"', "")

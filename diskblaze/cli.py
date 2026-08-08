@@ -155,6 +155,7 @@ def build_client(args: argparse.Namespace) -> DiskBlazeClient:
         retry_backoff=args.backoff,
         backoff_cap=getattr(args, "backoff_cap", 60.0),
         graphql_concurrency=getattr(args, "graphql_concurrency", 4),
+        log=log if VERBOSE else None,
     )
 
 

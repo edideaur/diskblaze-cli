@@ -385,11 +385,11 @@ def join_remote(parent: str, name: str) -> str:
 
 def preferred_part_size(size: int) -> int | None:
     if size >= 8 * 1024 * MiB:
-        return 256 * MiB
+        return 16 * MiB
     if size >= 1024 * MiB:
-        return 128 * MiB
+        return 8 * MiB
     if size >= 64 * MiB:
-        return 64 * MiB
+        return 4 * MiB
     return None
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import getpass
 import json
@@ -12,6 +13,7 @@ import threading
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TextIO
 
 import sentry_sdk
 from rich.console import Console
@@ -32,6 +34,7 @@ from .client import (
     DiskBlazeClient,
     DiskBlazeError,
     TransferProgress,
+    UploadIndex,
     endpoint_from_base,
     join_remote,
     normalize_remote_path,
@@ -62,11 +65,32 @@ SENTRY_DSN = "https://ac2ecf4a346a40699cfdc03a6ccd33f2@rustrak-api.edideaur.work
 # Whether to print per-file planning details. Toggled by --verbose.
 VERBOSE = False
 
+# Optional file handle that receives verbose diagnostics (see --log-file).
+LOGFILE_HANDLE: TextIO | None = None
+
+_LOG_LOCK = threading.Lock()
+
 
 def log(message: str) -> None:
-    """Print an informational message only when --verbose is enabled."""
-    if VERBOSE:
-        console.print(f"[dim]{message}[/dim]")
+    """Write a verbose diagnostic line to the log file, or to stderr when unset."""
+    if not VERBOSE:
+        return
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {message}"
+    with _LOG_LOCK:
+        if LOGFILE_HANDLE is not None:
+            LOGFILE_HANDLE.write(line + "\n")
+            LOGFILE_HANDLE.flush()
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+
+def _close_log_file() -> None:
+    handle = LOGFILE_HANDLE
+    if handle is not None:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 class ProgressMux:
@@ -374,17 +398,26 @@ def command_url(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_upload_error(exc: Exception, path: Path) -> None:
+    """Print a per-file upload failure and send it to Sentry, then continue."""
+    sentry_sdk.capture_exception(exc)
+    console.print(f"[red]error:[/red] upload failed for {path}: {exc}")
+
+
 def command_upload(args: argparse.Namespace) -> int:
     client = build_client(args)
     local = Path(args.local).expanduser()
     if not local.exists():
         raise DiskBlazeError(f"local path does not exist: {local}")
     remote = args.remote or join_remote("/private", local.name)
+    index = UploadIndex(args.index) if getattr(args, "index", None) else None
+    continue_on_error = getattr(args, "continue_on_error", False)
     if args.dry_run:
         console.print(f"[yellow]dry-run[/yellow] would upload {local} -> {remote}")
         return 0
     progress = transfer_progress(disable=getattr(args, "no_progress", False))
     mux = QuietProgress() if getattr(args, "no_progress", False) else ProgressMux(progress)
+    failures = 0
     with progress:
         if local.is_dir():
             result = client.upload_tree(
@@ -396,8 +429,16 @@ def command_upload(args: argparse.Namespace) -> int:
                 resume=args.resume,
                 create_folders=not args.no_create_folders,
                 progress=mux,
+                index=index,
+                continue_on_error=continue_on_error,
+                on_error=_report_upload_error if continue_on_error else None,
             )
-            console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
+            failures = result.failures
+            uploaded = (
+                f"[green]uploaded[/green] {len(result.files)} files to {remote}"
+                + (f" [red]({failures} failed)[/red]" if failures else "")
+            )
+            console.print(uploaded)
         else:
             target = remote
             existing = client.get_node(target)
@@ -412,9 +453,12 @@ def command_upload(args: argparse.Namespace) -> int:
                 resume=args.resume,
                 ensure_parent=not args.no_create_folders,
                 progress=mux,
+                index=index,
             )
             console.print(f"[green]uploaded[/green] {node.path} ({node.size})")
-    return 0
+    if index is not None:
+        index.save()
+    return 1 if failures else 0
 
 
 def command_download(args: argparse.Namespace) -> int:
@@ -930,6 +974,11 @@ def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = Fal
         "--verbose", action="store_true", help="Print per-file planning and progress details."
     )
     parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Write verbose diagnostics to this file (append) instead of stderr.",
+    )
+    parser.add_argument(
         "--retries",
         type=int,
         default=4,
@@ -1076,6 +1125,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_remote_arg(upload_cmd, "remote", nargs="?")
     upload_cmd.add_argument(
         "--part-size", type=int, default=None, help="Override multipart part size in bytes."
+    )
+    upload_cmd.add_argument(
+        "--index",
+        default=None,
+        metavar="PATH",
+        help="Persistent JSON index of uploaded files; skip unchanged files without rechecking.",
+    )
+    upload_cmd.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Report per-file failures and keep uploading instead of aborting the run.",
     )
     add_transfer_common(upload_cmd)
     upload_cmd.set_defaults(func=command_upload)
@@ -1289,6 +1349,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     global VERBOSE
     VERBOSE = bool(getattr(args, "verbose", False))
+    log_file = getattr(args, "log_file", None)
+    global LOGFILE_HANDLE
+    if log_file:
+        try:
+            LOGFILE_HANDLE = open(log_file, "a", encoding="utf-8")  # noqa: SIM115
+            atexit.register(_close_log_file)
+        except OSError as exc:
+            console.print(f"[yellow]warning:[/yellow] cannot open --log-file: {exc}")
     try:
         return int(args.func(args))
     except KeyboardInterrupt:

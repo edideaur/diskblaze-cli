@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import json
 import os
 import posixpath
 import threading
@@ -137,7 +138,83 @@ class CopyJob:
     progress_percent: float
 
 
+@dataclass
+class TreeUploadResult:
+    files: list[FileNode]
+    failures: int = 0
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+
 ProgressCallback = Callable[[TransferProgress], None]
+
+
+class UploadIndex:
+    """Persistent record of files/folders already uploaded.
+
+    Lets subsequent uploads skip unchanged local files without a round-trip to
+    the control plane. Files are matched on size + mtime (optionally sha256).
+    """
+
+    def __init__(self, path: str | Path | None):
+        self.path = Path(path) if path else None
+        self._files: dict[str, dict] = {}
+        self._dirs: set[str] = set()
+        self._lock = threading.Lock()
+        if self.path is not None and self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            if isinstance(data, dict):
+                files = data.get("files")
+                if isinstance(files, dict):
+                    self._files = {
+                        key: value for key, value in files.items() if isinstance(value, dict)
+                    }
+                dirs = data.get("dirs")
+                if isinstance(dirs, dict):
+                    self._dirs = {key for key, value in dirs.items() if value}
+
+    def should_skip_file(
+        self, remote: str, *, size: int, mtime_ns: int, sha256: str | None
+    ) -> bool:
+        with self._lock:
+            entry = self._files.get(remote)
+        if not entry:
+            return False
+        if entry.get("size") != size or entry.get("mtime_ns") != mtime_ns:
+            return False
+        if sha256 is not None and entry.get("sha256"):
+            return entry["sha256"].lower() == sha256.lower()
+        return True
+
+    def record_file(self, remote: str, *, size: int, mtime_ns: int, sha256: str | None) -> None:
+        with self._lock:
+            self._files[remote] = {"size": size, "mtime_ns": mtime_ns, "sha256": sha256}
+
+    def has_dir(self, remote: str) -> bool:
+        with self._lock:
+            return remote in self._dirs
+
+    def record_dir(self, remote: str) -> None:
+        with self._lock:
+            self._dirs.add(remote)
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            files = dict(self._files)
+            dirs = set(self._dirs)
+        payload = json.dumps(
+            {"version": 1, "files": files, "dirs": dict.fromkeys(dirs, True)},
+            indent=2,
+        )
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self.path)
 
 
 CREATE_UPLOAD_PLAN = """
@@ -406,6 +483,20 @@ def _node_from_payload(data: dict) -> FileNode:
         updated_at=str(data.get("updatedAt") or ""),
         readonly=bool(data.get("readonly")),
         content_sha256=data.get("contentSha256"),
+    )
+
+
+def _placeholder_file_node(remote: str, size: int) -> FileNode:
+    """A synthetic node for dry-run / skipped uploads (no real remote id)."""
+    return FileNode(
+        id="",
+        name=posixpath.basename(remote),
+        path=remote,
+        parent_path=posixpath.dirname(remote),
+        is_dir=False,
+        size_bytes=size,
+        size=str(size),
+        updated_at="",
     )
 
 
@@ -867,24 +958,24 @@ class DiskBlazeClient:
         resume: bool = False,
         dry_run: bool = False,
         progress: ProgressCallback | None = None,
+        index: UploadIndex | None = None,
     ) -> FileNode:
         path = Path(local_path)
-        size = path.stat().st_size
+        stat_result = path.stat()
+        size = stat_result.st_size
+        mtime_ns = stat_result.st_mtime_ns
         remote = normalize_remote_path(remote_path)
         parent = posixpath.dirname(remote)
         self._log(f"[upload] {remote} ({size} bytes, resume={resume}, checksum={checksum})")
         if dry_run:
             # No side effects; report the intended target as if it succeeded.
-            return FileNode(
-                id="",
-                name=posixpath.basename(remote),
-                path=remote,
-                parent_path=parent,
-                is_dir=False,
-                size_bytes=size,
-                size=str(size),
-                updated_at="",
-            )
+            return _placeholder_file_node(remote, size)
+        if index is not None and index.should_skip_file(
+            remote, size=size, mtime_ns=mtime_ns, sha256=None
+        ):
+            self._log(f"[upload] index skip {remote} (size={size}, mtime unchanged)")
+            progress and progress(TransferProgress(remote, size, size, "skipped", 0))
+            return _placeholder_file_node(remote, size)
         if resume:
             existing = self.get_node(remote)
             if existing is not None and existing.size_bytes == size:
@@ -892,11 +983,15 @@ class DiskBlazeClient:
                 if not checksum:
                     self._log("[upload] skipping (no checksum check)")
                     progress and progress(TransferProgress(remote, size, size, "skipped", 0))
+                    if index is not None:
+                        index.record_file(remote, size=size, mtime_ns=mtime_ns, sha256=None)
                     return existing
                 sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress)
                 if existing.content_sha256 and existing.content_sha256.lower() == sha256.lower():
                     self._log(f"[upload] skipping (sha256 matches: {sha256[:16]}...)")
                     progress and progress(TransferProgress(remote, size, size, "skipped", 0))
+                    if index is not None:
+                        index.record_file(remote, size=size, mtime_ns=mtime_ns, sha256=sha256)
                     return existing
                 remote_hash = (
                     existing.content_sha256[:16]
@@ -965,7 +1060,10 @@ class DiskBlazeClient:
                     time.sleep(delay)
             progress and progress(TransferProgress(remote, size, size, "completing", 0))
             self._log("[upload] completing upload")
-            return self.complete_upload(plan.token, content_sha256=sha256 or None)
+            node = self.complete_upload(plan.token, content_sha256=sha256 or None)
+            if index is not None:
+                index.record_file(remote, size=size, mtime_ns=mtime_ns, sha256=sha256)
+            return node
 
         if not plan.parts:
             raise DiskBlazeError("upload plan did not include a PUT URL or multipart parts")
@@ -1008,9 +1106,12 @@ class DiskBlazeClient:
         completed.sort(key=lambda item: int(item["number"]))
         progress and progress(TransferProgress(remote, size, size, "completing", 0))
         self._log("[upload] completing multipart upload")
-        return self.complete_upload(
+        node = self.complete_upload(
             plan.token, completed_parts=completed, content_sha256=sha256 or None
         )
+        if index is not None:
+            index.record_file(remote, size=size, mtime_ns=mtime_ns, sha256=sha256)
+        return node
 
     def upload_tree(
         self,
@@ -1024,22 +1125,25 @@ class DiskBlazeClient:
         dry_run: bool = False,
         create_folders: bool = True,
         progress: ProgressCallback | None = None,
-    ) -> list[FileNode]:
+        index: UploadIndex | None = None,
+        continue_on_error: bool = False,
+        on_error: Callable[[Exception, Path], None] | None = None,
+    ) -> TreeUploadResult:
         root = Path(local_path)
         if root.is_file():
             self._log(f"[upload-tree] single file: {root}")
-            return [
-                self.upload_file(
-                    root,
-                    join_remote(remote_dir, root.name),
-                    workers=workers,
-                    checksum=checksum,
-                    resume=resume,
-                    dry_run=dry_run,
-                    ensure_parent=create_folders,
-                    progress=progress,
-                )
-            ]
+            node = self.upload_file(
+                root,
+                join_remote(remote_dir, root.name),
+                workers=workers,
+                checksum=checksum,
+                resume=resume,
+                dry_run=dry_run,
+                ensure_parent=create_folders,
+                progress=progress,
+                index=index,
+            )
+            return TreeUploadResult(files=[node])
         files = [path for path in root.rglob("*") if path.is_file()]
         self._log(f"[upload-tree] found {len(files)} files under {root}")
         if create_folders:
@@ -1052,8 +1156,13 @@ class DiskBlazeClient:
                     dirs.add(join_remote(remote_dir, parent))
             self._log(f"[upload-tree] ensuring {len(dirs)} remote folders")
             for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
+                if index is not None and index.has_dir(remote_folder):
+                    continue
                 self.ensure_folder(remote_folder)
+                if index is not None:
+                    index.record_dir(remote_folder)
         results: list[FileNode] = []
+        failures = 0
         self._log(
             f"[upload-tree] uploading {len(files)} files "
             f"with {file_workers} file-workers, {workers} part-workers"
@@ -1078,6 +1187,7 @@ class DiskBlazeClient:
                         dry_run=dry_run,
                         ensure_parent=create_folders,
                         progress=progress,
+                        index=index,
                     )
                 ] = file_path
             for future in as_completed(futures):
@@ -1085,13 +1195,23 @@ class DiskBlazeClient:
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    failed = True
-                    for pending in futures:
-                        pending.cancel()
-                    raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
+                    if continue_on_error:
+                        failures += 1
+                        if on_error is not None:
+                            on_error(exc, file_path)
+                        else:
+                            self._log(f"[upload-tree] failed {file_path}: {exc}")
+                    else:
+                        failed = True
+                        for pending in futures:
+                            pending.cancel()
+                        raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
         finally:
-            executor.shutdown(wait=not failed, cancel_futures=failed)
-        return results
+            if failed:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
+        return TreeUploadResult(files=results, failures=failures)
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:
         data = self.graphql(

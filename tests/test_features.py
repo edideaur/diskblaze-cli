@@ -18,6 +18,7 @@ from diskblaze.client import (
     DiskBlazeClient,
     FileNode,
     TransferProgress,
+    UploadIndex,
     UploadPlan,
     _parse_retry_after,
     normalize_remote_path,
@@ -173,6 +174,91 @@ def test_upload_tree_resume_skips_unchanged(tmp_path: Path):
     )
     client.upload_tree(src, "/private/dst", resume=True, checksum=False, file_workers=1)
     assert client.put_calls == 0
+
+
+def test_upload_index_skips_unchanged_files(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.bin").write_bytes(b"data")
+    (src / "b.bin").write_bytes(b"more")
+    index_path = tmp_path / "upload-index.json"
+
+    index = UploadIndex(index_path)
+    client = FullClient()
+    result = client.upload_tree(src, "/private/dst", index=index, file_workers=2)
+    assert len(result) == 2
+    assert client.put_calls == 2
+    index.save()
+
+    index2 = UploadIndex(index_path)
+    client2 = FullClient()
+    result2 = client2.upload_tree(src, "/private/dst", index=index2, file_workers=2)
+    assert len(result2) == 2
+    assert client2.put_calls == 0
+
+
+def test_upload_index_resume_records_remote_skip(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "x.bin").write_bytes(b"data")
+    index_path = tmp_path / "idx.json"
+    index = UploadIndex(index_path)
+    client = FullClient()
+    client.remote["/private/dst/x.bin"] = FileNode(
+        id="r",
+        name="x.bin",
+        path="/private/dst/x.bin",
+        parent_path="/private/dst",
+        is_dir=False,
+        size_bytes=4,
+        size="4",
+        updated_at="",
+        content_sha256=None,
+    )
+    client.upload_tree(
+        src, "/private/dst", resume=True, checksum=False, file_workers=1, index=index
+    )
+    assert client.put_calls == 0
+    index.save()
+    client2 = FullClient()
+    result2 = client2.upload_tree(
+        src, "/private/dst", file_workers=1, index=UploadIndex(index_path)
+    )
+    assert client2.put_calls == 0
+    assert len(result2) == 1
+
+
+def test_upload_tree_continue_on_error(tmp_path: Path):
+    for idx in range(5):
+        (tmp_path / f"{idx}.bin").write_bytes(b"x")
+
+    attempted: list[str] = []
+    errors: list[tuple[Exception, Path]] = []
+
+    class FlakyClient(DiskBlazeClient):
+        def __init__(self):
+            pass
+
+        def ensure_folder(self, path: str) -> None:
+            return None
+
+        def upload_file(self, path, *_args, **_kwargs):
+            attempted.append(Path(path).name)
+            if Path(path).name == "2.bin":
+                raise RuntimeError("boom")
+            return None
+
+    result = FlakyClient().upload_tree(
+        tmp_path,
+        "/public/test",
+        file_workers=1,
+        continue_on_error=True,
+        on_error=lambda exc, path: errors.append((exc, path)),
+    )
+    assert result.failures == 1
+    assert len(result.files) == 4
+    assert len(errors) == 1
+    assert sorted(attempted) == [f"{idx}.bin" for idx in range(5)]
 
 
 def test_watcher_uploads_new_and_changed_files(tmp_path: Path):

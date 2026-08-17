@@ -8,9 +8,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import niquests
 import pytest
-import requests
-from requests.structures import CaseInsensitiveDict
+from niquests.structures import CaseInsensitiveDict
 
 from diskblaze.cli import QuietProgress, transfer_progress
 from diskblaze.client import (
@@ -925,7 +925,7 @@ def test_trash_older_than_keeps_recent_entries(capsys):
     assert len(reader) == 2
 
 
-class _FakeResponse(requests.Response):
+class _FakeResponse(niquests.Response):
     def __init__(self, status, headers=None, payload=None):
         super().__init__()
         self.status_code = status
@@ -934,13 +934,13 @@ class _FakeResponse(requests.Response):
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(response=self)
+            raise niquests.HTTPError(response=self)
 
     def json(self, **kwargs):
         return self._payload
 
 
-class _FakeSession(requests.Session):
+class _FakeSession(niquests.Session):
     def __init__(self, responses):
         super().__init__()
         self._responses = list(responses)
@@ -994,11 +994,11 @@ def test_graphql_retries_on_429_and_honors_retry_after():
 
 def test_graphql_surfaces_permanent_error_without_retry():
     client = _RetryClient([_FakeResponse(403, {})])
-    with mock.patch("time.sleep", lambda _s: None), pytest.raises(requests.HTTPError):
+    with mock.patch("time.sleep", lambda _s: None), pytest.raises(niquests.HTTPError):
         client.graphql("query { ok }")
 
 
-class _SlowSession(requests.Session):
+class _SlowSession(niquests.Session):
     def __init__(self, holder):
         super().__init__()
         self._holder = holder

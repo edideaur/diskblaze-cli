@@ -24,14 +24,14 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
-  "requests>=2.31",
+  "niquests>=3.0",
   "rich>=13.0",
+  "sentry-sdk>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
-  "requests-mock>=1.11",
   "ruff>=0.6",
   "ty>=0.0.1a",
 ]

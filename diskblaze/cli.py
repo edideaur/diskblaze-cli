@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import sentry_sdk
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -54,6 +55,8 @@ def add_remote_arg(parser: argparse.ArgumentParser, *args, **kwargs) -> None:
 
 
 console = Console()
+
+SENTRY_DSN = "https://ac2ecf4a346a40699cfdc03a6ccd33f2@rustrak-api.edideaur.works/5"
 
 
 # Whether to print per-file planning details. Toggled by --verbose.
@@ -892,7 +895,7 @@ def _human_size(num: float) -> str:
 
 def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
     default = argparse.SUPPRESS if suppress_defaults else None
-    timeout_default = argparse.SUPPRESS if suppress_defaults else 120.0
+    timeout_default = argparse.SUPPRESS if suppress_defaults else 3600.0
     workers_default = argparse.SUPPRESS if suppress_defaults else 64
     file_workers_default = argparse.SUPPRESS if suppress_defaults else 8
     parser.add_argument(
@@ -905,7 +908,12 @@ def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = Fal
         default=default,
         help="API key. Default: saved login, DISKBLAZE_TOKEN, or DISKBLAZE_API_KEY",
     )
-    parser.add_argument("--timeout", type=float, default=timeout_default)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=timeout_default,
+        help="Per-request timeout in seconds. Default: 3600 (1 hour).",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -1266,6 +1274,11 @@ def _remote_path_completer(prefix, **kwargs):
 
 
 def main(argv: list[str] | None = None) -> int:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        # Attach data like request headers and IP for users.
+        send_default_pii=True,
+    )
     parser = build_parser()
     try:
         import argcomplete
@@ -1282,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print("\n[yellow]cancelled[/yellow]")
         return 130
     except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         console.print(f"[red]error:[/red] {exc}")
         return 1
 

@@ -4,7 +4,7 @@ import hashlib
 import threading
 from pathlib import Path
 
-import requests
+import niquests
 
 from diskblaze.cli import build_parser
 from diskblaze.client import (
@@ -141,7 +141,7 @@ def test_progress_reader_prepares_fixed_length_request(tmp_path: Path):
     local.write_bytes(b"x" * 1024)
     with local.open("rb") as handle:
         reader = _ProgressReader(handle, length=512, offset=0, callback=None)
-        prepared = requests.Request("PUT", "https://example.invalid", data=reader).prepare()
+        prepared = niquests.Request("PUT", "https://example.invalid", data=reader).prepare()
 
     assert prepared.headers["Content-Length"] == "512"
     assert "Transfer-Encoding" not in prepared.headers

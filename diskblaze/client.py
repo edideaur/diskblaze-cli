@@ -13,9 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import niquests
+from niquests.adapters import HTTPAdapter
+from niquests.packages.urllib3.util.retry import Retry  # ty: ignore[unresolved-import]
+from niquests.structures import CaseInsensitiveDict
 
 DEFAULT_ENDPOINT = "https://diskblaze.com/graphql"
 MiB = 1024 * 1024
@@ -503,7 +504,7 @@ class DiskBlazeClient:
         *,
         endpoint: str | None = None,
         token: str | None = None,
-        timeout: float = 120.0,
+        timeout: float = 3600.0,
         pool_size: int = 64,
         retries: int = 4,
         retry_backoff: float = 0.5,
@@ -535,9 +536,9 @@ class DiskBlazeClient:
     def _log(self) -> Callable[[str], None]:
         return getattr(self, "_log_fn", lambda msg: None)
 
-    def _new_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(self._headers)
+    def _new_session(self) -> niquests.Session:
+        session = niquests.Session()
+        session.headers = CaseInsensitiveDict(self._headers)
         retry = Retry(
             total=self.retries,
             backoff_factor=self.retry_backoff,
@@ -555,18 +556,18 @@ class DiskBlazeClient:
         session.mount("https://", adapter)
         return session
 
-    def _session(self) -> requests.Session:
+    def _session(self) -> niquests.Session:
         session = getattr(self._local, "session", None)
         if session is None:
             session = self._new_session()
             self._local.session = session
         return session
 
-    def _upload_session(self) -> requests.Session:
+    def _upload_session(self) -> niquests.Session:
         session = getattr(self._local, "upload_session", None)
         if session is None:
-            session = requests.Session()
-            session.headers.update(self._headers)
+            session = niquests.Session()
+            session.headers = CaseInsensitiveDict(self._headers)
             retry = Retry(total=0, raise_on_status=False)
             adapter = HTTPAdapter(
                 pool_connections=self.pool_size,
@@ -621,15 +622,15 @@ class DiskBlazeClient:
                         raise DiskBlazeError("GraphQL response did not include data")
                     self._log(f"[graphql] {op} ok")
                     return data
-                except (requests.RequestException, DiskBlazeError) as exc:
+                except (niquests.RequestException, DiskBlazeError) as exc:
                     last_exc = exc
                     self._log(f"[graphql] {op} error: {exc}")
                     if attempt < attempts - 1:
                         resp = getattr(exc, "response", None)
                         retryable = (
-                            isinstance(resp, requests.Response)
+                            isinstance(resp, niquests.Response)
                             and resp.status_code in (429, 500, 502, 503, 504)
-                        ) or isinstance(exc, (requests.ConnectionError, DiskBlazeError))
+                        ) or isinstance(exc, (niquests.ConnectionError, DiskBlazeError))
                         if retryable:
                             retry_after = (
                                 _parse_retry_after(resp.headers.get("Retry-After"))
@@ -952,7 +953,7 @@ class DiskBlazeClient:
                         self._put_stream(plan.put_url, reader, length=size)
                     self._log("[upload] put succeeded")
                     break
-                except requests.RequestException as exc:
+                except niquests.RequestException as exc:
                     self._log(f"[upload] put attempt {attempt + 1}/{attempts} failed: {exc}")
                     if attempt == attempts - 1:
                         raise
@@ -1233,13 +1234,13 @@ class DiskBlazeClient:
         accepts_ranges = False
         try:
             probe = self._session().head(url, allow_redirects=True, timeout=self.timeout)
-            if probe.status_code < 400:
+            if (probe.status_code or 0) < 400:
                 size = int(probe.headers.get("Content-Length") or 0)
                 accepts_ranges = probe.headers.get("Accept-Ranges", "").lower() == "bytes"
                 self._log(f"[download] HEAD: {size} bytes, ranges={accepts_ranges}")
             elif probe.status_code not in {405, 501}:
                 probe.raise_for_status()
-        except requests.RequestException as exc:
+        except niquests.RequestException as exc:
             self._log(f"[download] HEAD failed: {exc}")
             size = 0
             accepts_ranges = False
@@ -1258,7 +1259,7 @@ class DiskBlazeClient:
                     if "/" in content_range:
                         size = int(content_range.rsplit("/", 1)[1])
                     accepts_ranges = True
-                elif range_probe.status_code < 400:
+                elif (range_probe.status_code or 0) < 400:
                     size = int(range_probe.headers.get("Content-Length") or 0)
                 else:
                     range_probe.raise_for_status()
@@ -1390,7 +1391,7 @@ class DiskBlazeClient:
                     f"(etag={etag[:8] if etag else 'none'})"
                 )
                 break
-            except requests.RequestException as exc:
+            except niquests.RequestException as exc:
                 last_error = exc
                 self._log(
                     f"[upload-part] part {part.number} "
@@ -1435,7 +1436,7 @@ class DiskBlazeClient:
                             progress(start, loaded)
                 self._log(f"[download-range] bytes {start}-{end - 1} done ({loaded} bytes)")
                 return
-            except requests.RequestException as exc:
+            except niquests.RequestException as exc:
                 last_error = exc
                 self._log(f"[download-range] attempt {attempt + 1}/{attempts} failed: {exc}")
                 if attempt == attempts - 1:
